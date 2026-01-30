@@ -1,4 +1,4 @@
-# 🚀 PHP_Laravel12_Secure_Logout_From_All_Devices_API
+#  PHP_Laravel12_Secure_Logout_From_All_Devices_API
 
 ![Laravel](https://img.shields.io/badge/Laravel-12-red)
 ![Sanctum](https://img.shields.io/badge/Auth-Sanctum-blue)
@@ -18,6 +18,37 @@ This step-by-step guide walks you through building a Laravel 12 API authenticati
 * Logout from All Devices
 
 ---
+
+##  Features
+
+* User Registration API
+* User Login API
+* Token-Based Authentication using Laravel Sanctum
+* Logout from Current Device
+* Logout from Other Devices
+* Logout from All Devices
+* Secure multi-device session handling
+
+---
+
+##  Folder Structure 
+
+```
+app/
+ ├── Models/
+ │   └── User.php
+ └── Http/
+     └── Controllers/
+         └── API/
+             └── AuthController.php
+
+bootstrap/
+ └── app.php
+
+routes/
+ └── api.php
+```
+
 
 ##  1. Install Laravel 12 Project
 
@@ -339,24 +370,6 @@ Accept: application/json
 ```
 <img width="1792" height="713" alt="Screenshot 2026-01-30 163316" src="https://github.com/user-attachments/assets/f9b59af9-7caf-491e-9b1b-04c697ec1b3b" />
 
----
-
-### Logout Other Devices
-
-**POST** `/api/logout-others`
-
-```
-Authorization: Bearer CURRENT_DEVICE_TOKEN
-Accept: application/json
-```
-
-```json
-{
-  "status": true,
-  "message": "Logged out from other devices"
-}
-```
-<img width="1804" height="730" alt="Screenshot 2026-01-30 163533" src="https://github.com/user-attachments/assets/09fd9b31-4ceb-4014-98f6-cb2ccb5a1807" />
 
 ---
 
@@ -375,14 +388,40 @@ Accept: application/json
   "message": "Logged out from all devices"
 }
 ```
-<img width="1802" height="785" alt="Screenshot 2026-01-30 163900" src="https://github.com/user-attachments/assets/cbdadfa1-f4d0-47db-9639-b6f0a907c9f6" />
+<img width="1804" height="730" alt="Screenshot 2026-01-30 163533" src="https://github.com/user-attachments/assets/ca3e1f4e-3f36-4120-8a4d-cad4dc723554" />
+
+
+---
+### Logout Other Devices
+
+**POST** `/api/logout-others`
+
+```
+Authorization: Bearer CURRENT_DEVICE_TOKEN
+Accept: application/json
+```
+
+```json
+{
+  "status": true,
+  "message": "Logged out from other devices"
+}
+
+```
+Now:
+*	TOKEN_A still works ✅
+*	TOKEN_B → 401 Unauthorized ❌
+
+
+<img width="1802" height="785" alt="Screenshot 2026-01-30 163900" src="https://github.com/user-attachments/assets/1ce5a7ec-7a1a-4ceb-b8db-a504d1efd7f6" />
+
 
 ---
 
 ##  Final Result
 
-✔ Token-based authentication
-✔ Secure logout (current device)
-✔ Logout other sessions
-✔ Logout from all devices
-✔ Unauthorized protection after logout
+* ✔ Token-based authentication
+* ✔ Secure logout (current device)
+* ✔ Logout other sessions
+* ✔ Logout from all devices
+* ✔ Unauthorized protection after logout
