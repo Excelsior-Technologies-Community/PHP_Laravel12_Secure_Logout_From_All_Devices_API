@@ -4,6 +4,7 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Laravel\Sanctum\PersonalAccessToken;
 
 class AuthActivity extends Model
 {
@@ -21,5 +22,16 @@ class AuthActivity extends Model
     public function user(): BelongsTo
     {
         return $this->belongsTo(User::class);
+    }
+
+    /**
+     * Activity belongs to a Sanctum token.
+     */
+    public function token(): BelongsTo
+    {
+        return $this->belongsTo(
+            PersonalAccessToken::class,
+            'token_id'
+        );
     }
 }
