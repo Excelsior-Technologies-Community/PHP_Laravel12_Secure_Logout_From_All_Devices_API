@@ -5,16 +5,27 @@ namespace App\Http\Controllers\API;
 use App\Http\Controllers\Controller;
 use App\Models\AuthActivity;
 use App\Models\User;
+use App\Services\DeviceFingerprintService;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Str;
 
 class AuthController extends Controller
 {
+    protected DeviceFingerprintService $fingerprintService;
+
+    public function __construct(DeviceFingerprintService $fingerprintService)
+    {
+        $this->fingerprintService = $fingerprintService;
+    }
+
     /**
-     * Register a new user.
+     * Register a new user with device fingerprinting.
      */
-    public function register(Request $request)
+    public function register(Request $request): JsonResponse
     {
         $validator = Validator::make($request->all(), [
             'name' => 'required|string|max:255',
@@ -36,36 +47,47 @@ class AuthController extends Controller
             'password' => Hash::make($request->password),
         ]);
 
-        $deviceName = $request->device_name ?? 'Unknown Device';
+        $fingerprint = $this->fingerprintService->inspect($request, $user);
+        $deviceName = $request->device_name ?: $fingerprint['client_name'];
 
         $accessToken = $user->createToken($deviceName);
+        $tokenModel = $accessToken->accessToken;
 
-        $this->recordActivity(
-            $user,
-            $accessToken->accessToken->id,
-            'REGISTER',
-            $request
-        );
+        // Store device fingerprint in token record
+        $tokenModel->update([
+            'device_type' => $fingerprint['device_type'],
+            'browser' => $fingerprint['browser'],
+            'os' => $fingerprint['os'],
+            'ip_address' => $fingerprint['ip_address'],
+            'city' => $fingerprint['city'],
+            'country' => $fingerprint['country'],
+            'country_code' => $fingerprint['country_code'],
+            'is_suspicious' => false,
+            'last_active_at' => now(),
+        ]);
+
+        $this->recordActivity($user, $tokenModel->id, 'REGISTER', $request, $fingerprint);
 
         return response()->json([
             'status' => true,
-            'message' => 'User registered successfully',
+            'message' => 'User registered successfully with device fingerprint! 🛡️',
             'token' => $accessToken->plainTextToken,
-            'token_id' => $accessToken->accessToken->id,
+            'token_id' => $tokenModel->id,
             'device_name' => $deviceName,
+            'fingerprint' => $fingerprint,
             'user' => $user,
         ], 201);
     }
 
     /**
-     * Login user and create a new device session.
+     * Login user, analyze risk, and create a fingerprinted session.
      */
-    public function login(Request $request)
+    public function login(Request $request): JsonResponse
     {
         $validator = Validator::make($request->all(), [
             'email' => 'required|email',
             'password' => 'required|string',
-            'device_name' => 'required|string|max:255',
+            'device_name' => 'nullable|string|max:255',
         ]);
 
         if ($validator->fails()) {
@@ -73,692 +95,499 @@ class AuthController extends Controller
                 'status' => false,
                 'errors' => $validator->errors(),
             ], 422);
+        }
+
+        // Brute-force shield rate limiting
+        $throttleKey = Str::transliterate(Str::lower($request->email) . '|' . $request->ip());
+        if (RateLimiter::tooManyAttempts($throttleKey, 5)) {
+            $seconds = RateLimiter::availableIn($throttleKey);
+            return response()->json([
+                'status' => false,
+                'message' => "Too many failed login attempts. Account temporarily locked for {$seconds} seconds.",
+                'locked_seconds' => $seconds,
+            ], 429);
         }
 
         $user = User::where('email', $request->email)->first();
 
         if (!$user || !Hash::check($request->password, $user->password)) {
+            RateLimiter::hit($throttleKey, 300); // 5 min lock on 5 failures
             return response()->json([
                 'status' => false,
-                'message' => 'Invalid credentials',
+                'message' => 'Invalid email or password credentials.',
             ], 401);
         }
 
-        $accessToken = $user->createToken($request->device_name);
+        // Account Freeze Check
+        if ($user->is_frozen) {
+            return response()->json([
+                'status' => false,
+                'message' => '⚠️ Account is currently FROZEN due to a security freeze: ' . ($user->freeze_reason ?? 'Security lock active'),
+                'is_frozen' => true,
+                'frozen_at' => $user->frozen_at,
+            ], 403);
+        }
 
-        $this->recordActivity(
-            $user,
-            $accessToken->accessToken->id,
-            'LOGIN',
-            $request
-        );
+        RateLimiter::clear($throttleKey);
+
+        // Generate Deep Device Fingerprint & Suspicious Login Detection
+        $fingerprint = $this->fingerprintService->inspect($request, $user);
+        $deviceName = $request->device_name ?: $fingerprint['client_name'];
+
+        $accessToken = $user->createToken($deviceName);
+        $tokenModel = $accessToken->accessToken;
+
+        $tokenModel->update([
+            'device_type' => $fingerprint['device_type'],
+            'browser' => $fingerprint['browser'],
+            'os' => $fingerprint['os'],
+            'ip_address' => $fingerprint['ip_address'],
+            'city' => $fingerprint['city'],
+            'country' => $fingerprint['country'],
+            'country_code' => $fingerprint['country_code'],
+            'is_suspicious' => $fingerprint['is_suspicious'],
+            'last_active_at' => now(),
+        ]);
+
+        $this->recordActivity($user, $tokenModel->id, 'LOGIN', $request, $fingerprint);
 
         return response()->json([
             'status' => true,
-            'message' => 'Login successful',
+            'message' => $fingerprint['is_suspicious']
+                ? '⚠️ Login successful, but suspicious activity detected!'
+                : 'Login successful! Active device session registered.',
             'token' => $accessToken->plainTextToken,
-            'token_id' => $accessToken->accessToken->id,
-            'device_name' => $request->device_name,
+            'token_id' => $tokenModel->id,
+            'device_name' => $deviceName,
+            'fingerprint' => $fingerprint,
+            'is_suspicious' => $fingerprint['is_suspicious'],
+            'risk_score' => $fingerprint['risk_score'],
+            'risk_reason' => $fingerprint['risk_reason'],
             'user' => $user,
         ]);
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | 1. Current User Profile
-    |--------------------------------------------------------------------------
-    */
-
     /**
-     * Get currently authenticated user.
+     * Current authenticated user.
      */
-    public function me(Request $request)
+    public function me(Request $request): JsonResponse
     {
         $user = $request->user();
-
         return response()->json([
             'status' => true,
             'message' => 'Authenticated user retrieved successfully',
             'user' => $user,
-        ]);
-    }
-
-    /*
-    |--------------------------------------------------------------------------
-    | Existing Logout APIs
-    |--------------------------------------------------------------------------
-    */
-
-    /**
-     * Logout current device.
-     */
-    public function logout(Request $request)
-    {
-        $user = $request->user();
-        $currentToken = $user->currentAccessToken();
-
-        $tokenId = $currentToken?->id;
-
-        $this->recordActivity(
-            $user,
-            $tokenId,
-            'LOGOUT',
-            $request
-        );
-
-        if ($currentToken) {
-            $currentToken->delete();
-        }
-
-        return response()->json([
-            'status' => true,
-            'message' => 'Logged out from current device',
+            'active_devices_count' => $user->tokens()->count(),
+            'is_frozen' => (bool) $user->is_frozen,
         ]);
     }
 
     /**
-     * Logout from all devices.
+     * Active Devices Command Center List
      */
-    public function logoutAll(Request $request)
+    public function activeDevices(Request $request): JsonResponse
     {
         $user = $request->user();
-        $currentToken = $user->currentAccessToken();
+        $currentTokenId = $user->currentAccessToken()?->id;
 
-        $currentTokenId = $currentToken?->id;
+        $devices = $user->tokens()->latest('created_at')->get()->map(function ($token) use ($currentTokenId) {
+            $flag = (new DeviceFingerprintService())->getCountryFlag($token->country_code);
 
-        $this->recordActivity(
-            $user,
-            $currentTokenId,
-            'LOGOUT_ALL_DEVICES',
-            $request
-        );
-
-        $user->tokens()->delete();
-
-        return response()->json([
-            'status' => true,
-            'message' => 'Logged out from all devices',
-        ]);
-    }
-
-    /**
-     * Logout from all other devices except current device.
-     */
-    public function logoutOthers(Request $request)
-    {
-        $user = $request->user();
-        $currentToken = $user->currentAccessToken();
-
-        if (!$currentToken) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Current authentication token not found',
-            ], 401);
-        }
-
-        $currentTokenId = $currentToken->id;
-
-        $otherTokens = $user->tokens()
-            ->where('id', '!=', $currentTokenId)
-            ->get();
-
-        foreach ($otherTokens as $token) {
-            $this->recordActivity(
-                $user,
-                $token->id,
-                'LOGOUT_OTHER_DEVICES',
-                $request
-            );
-        }
-
-        $user->tokens()
-            ->where('id', '!=', $currentTokenId)
-            ->delete();
-
-        return response()->json([
-            'status' => true,
-            'message' => 'Logged out from other devices',
-            'current_token_id' => $currentTokenId,
-            'revoked_sessions' => $otherTokens->count(),
-        ]);
-    }
-
-    /*
-    |--------------------------------------------------------------------------
-    | Existing Device Management
-    |--------------------------------------------------------------------------
-    */
-
-    /**
-     * Get all currently active device sessions.
-     */
-    public function activeDevices(Request $request)
-    {
-        $user = $request->user();
-
-        if (!$user) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Unauthenticated',
-            ], 401);
-        }
-
-        $currentToken = $user->currentAccessToken();
-        $currentTokenId = $currentToken?->id;
-
-        $tokens = $user->tokens()
-            ->orderByDesc('last_used_at')
-            ->get();
-
-        $devices = $tokens->map(function ($token) use ($currentTokenId) {
             return [
-                'token_id' => $token->id,
+                'id' => $token->id,
                 'device_name' => $token->name,
-                'abilities' => $token->abilities,
-                'last_used_at' => $token->last_used_at,
+                'device_type' => $token->device_type ?: 'Desktop',
+                'device_icon' => $token->device_type === 'Mobile' ? '📱' : ($token->device_type === 'Tablet' ? '📱' : '💻'),
+                'browser' => $token->browser ?: 'Web Browser',
+                'os' => $token->os ?: 'Unknown OS',
+                'ip_address' => $token->ip_address ?: '127.0.0.1',
+                'city' => $token->city ?: 'Local',
+                'country' => $token->country ?: 'Network',
+                'country_code' => $token->country_code ?: 'IN',
+                'country_flag' => $flag,
+                'is_current' => $token->id === $currentTokenId,
+                'is_suspicious' => (bool) $token->is_suspicious,
+                'last_active_at' => $token->last_active_at ?? $token->last_used_at ?? $token->created_at,
                 'created_at' => $token->created_at,
-                'expires_at' => $token->expires_at,
-                'is_current_device' => (int) $token->id === (int) $currentTokenId,
             ];
-        })->values();
+        });
 
         return response()->json([
             'status' => true,
-            'message' => 'Active device sessions retrieved successfully',
+            'message' => 'Active devices retrieved successfully',
             'total_devices' => $devices->count(),
+            'current_token_id' => $currentTokenId,
             'devices' => $devices,
         ]);
     }
+
     /**
-     * Revoke a specific device session.
+     * Revoke single specific device session.
      */
-    public function revokeDevice(Request $request, int $tokenId)
+    public function revokeDevice(Request $request, int|string $tokenId): JsonResponse
     {
         $user = $request->user();
-
-        $token = $user->tokens()
-            ->where('id', $tokenId)
-            ->first();
+        $token = $user->tokens()->where('id', $tokenId)->first();
 
         if (!$token) {
             return response()->json([
                 'status' => false,
-                'message' => 'Device session not found',
+                'message' => 'Device session not found or already revoked.',
             ], 404);
         }
 
-        $isCurrentDevice =
-            $user->currentAccessToken()?->id === $token->id;
-
-        $this->recordActivity(
-            $user,
-            $token->id,
-            'DEVICE_REVOKED',
-            $request
-        );
-
         $deviceName = $token->name;
+        $isCurrent = $token->id === $user->currentAccessToken()?->id;
+
+        $fingerprint = $this->fingerprintService->inspect($request, $user);
+        $this->recordActivity($user, $token->id, $isCurrent ? 'LOGOUT' : 'DEVICE_REVOKED', $request, $fingerprint, "Revoked device: {$deviceName}");
 
         $token->delete();
 
         return response()->json([
             'status' => true,
-            'message' => 'Device session revoked successfully',
-            'token_id' => $tokenId,
-            'device_name' => $deviceName,
-            'was_current_device' => $isCurrentDevice,
+            'message' => "Device '{$deviceName}' revoked successfully.",
+            'is_current' => $isCurrent,
         ]);
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | 2. Change Password
-    |--------------------------------------------------------------------------
-    */
+    /**
+     * Revoke current active device session (Logout).
+     */
+    public function logout(Request $request): JsonResponse
+    {
+        return $this->revokeCurrentDevice($request);
+    }
+
+    public function revokeCurrentDevice(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        $currentToken = $user->currentAccessToken();
+
+        if ($currentToken) {
+            $fingerprint = $this->fingerprintService->inspect($request, $user);
+            $this->recordActivity($user, $currentToken->id, 'LOGOUT', $request, $fingerprint);
+            $currentToken->delete();
+        }
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Current device session logged out successfully.',
+        ]);
+    }
 
     /**
-     * Change password and revoke all existing sessions.
+     * Revoke all other devices except current device.
      */
-    public function changePassword(Request $request)
+    public function logoutOthers(Request $request): JsonResponse
     {
-        $validator = Validator::make($request->all(), [
-            'current_password' => 'required|string',
-            'new_password' => 'required|string|min:8|confirmed',
-        ]);
+        return $this->revokeAllOtherDevices($request);
+    }
 
-        if ($validator->fails()) {
-            return response()->json([
-                'status' => false,
-                'errors' => $validator->errors(),
-            ], 422);
-        }
-
+    public function revokeAllOtherDevices(Request $request): JsonResponse
+    {
         $user = $request->user();
-
-        if (!Hash::check(
-            $request->current_password,
-            $user->password
-        )) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Current password is incorrect',
-            ], 422);
-        }
-
-        if (Hash::check(
-            $request->new_password,
-            $user->password
-        )) {
-            return response()->json([
-                'status' => false,
-                'message' => 'New password must be different from current password',
-            ], 422);
-        }
-
-        $user->password = Hash::make($request->new_password);
-        $user->save();
-
         $currentTokenId = $user->currentAccessToken()?->id;
 
-        $this->recordActivity(
-            $user,
-            $currentTokenId,
-            'PASSWORD_CHANGED',
-            $request
-        );
+        $otherTokens = $user->tokens()->where('id', '!=', $currentTokenId);
+        $count = $otherTokens->count();
+
+        $fingerprint = $this->fingerprintService->inspect($request, $user);
+        $this->recordActivity($user, $currentTokenId, 'OTHER_DEVICES_REVOKED', $request, $fingerprint, "Revoked {$count} other device sessions.");
+
+        $otherTokens->delete();
+
+        return response()->json([
+            'status' => true,
+            'message' => "Successfully logged out {$count} other device session(s).",
+            'revoked_count' => $count,
+        ]);
+    }
+
+    /**
+     * Logout from ALL devices (including current).
+     */
+    public function logoutAll(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        $count = $user->tokens()->count();
+
+        $fingerprint = $this->fingerprintService->inspect($request, $user);
+        $this->recordActivity($user, null, 'ALL_DEVICES_LOGGED_OUT', $request, $fingerprint, "All {$count} device sessions terminated.");
 
         $user->tokens()->delete();
 
         return response()->json([
             'status' => true,
-            'message' => 'Password changed successfully. All devices have been logged out.',
+            'message' => "Successfully logged out from all {$count} devices.",
+            'revoked_count' => $count,
         ]);
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | 3. Change Email
-    |--------------------------------------------------------------------------
-    */
+    /**
+     * Emergency Kill Switch: Freeze account and instantly terminate all sessions.
+     */
+    public function emergencyFreeze(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        $reason = $request->input('reason', 'Emergency Kill Switch triggered by user due to security concern.');
+
+        $unlockToken = $user->freeze($reason);
+
+        $fingerprint = $this->fingerprintService->inspect($request, $user);
+        $this->recordActivity($user, null, 'EMERGENCY_ACCOUNT_FROZEN', $request, $fingerprint, "Emergency freeze active. All sessions killed.");
+
+        return response()->json([
+            'status' => true,
+            'message' => '🚨 Emergency Kill Switch activated! All device sessions terminated and account is FROZEN.',
+            'is_frozen' => true,
+            'frozen_at' => $user->frozen_at,
+            'unlock_token' => $unlockToken,
+        ]);
+    }
 
     /**
-     * Change authenticated user's email.
+     * Unfreeze account using email, password, and unlock token.
      */
-    public function changeEmail(Request $request)
+    public function unfreezeAccount(Request $request): JsonResponse
     {
         $validator = Validator::make($request->all(), [
-            'new_email' => 'required|email|unique:users,email',
+            'email' => 'required|email',
             'password' => 'required|string',
+            'unlock_token' => 'required|string',
         ]);
 
         if ($validator->fails()) {
-            return response()->json([
-                'status' => false,
-                'errors' => $validator->errors(),
-            ], 422);
+            return response()->json(['status' => false, 'errors' => $validator->errors()], 422);
         }
 
-        $user = $request->user();
+        $user = User::where('email', $request->email)->first();
 
-        if (!Hash::check($request->password, $user->password)) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Password is incorrect',
-            ], 422);
+        if (!$user || !Hash::check($request->password, $user->password)) {
+            return response()->json(['status' => false, 'message' => 'Invalid email or password.'], 401);
         }
 
-        $oldEmail = $user->email;
+        if (!$user->is_frozen) {
+            return response()->json(['status' => true, 'message' => 'Account is not currently frozen.']);
+        }
 
-        $user->email = $request->new_email;
-        $user->save();
+        if ($user->freeze_token !== $request->unlock_token) {
+            return response()->json(['status' => false, 'message' => 'Invalid unlock token.'], 403);
+        }
 
-        $this->recordActivity(
-            $user,
-            $user->currentAccessToken()?->id,
-            'EMAIL_CHANGED',
-            $request
-        );
+        $user->unfreeze();
+
+        $fingerprint = $this->fingerprintService->inspect($request, $user);
+        $this->recordActivity($user, null, 'ACCOUNT_UNFROZEN', $request, $fingerprint, "Account restored.");
 
         return response()->json([
             'status' => true,
-            'message' => 'Email address changed successfully',
-            'old_email' => $oldEmail,
-            'new_email' => $user->email,
+            'message' => '✅ Account un-frozen successfully! You can now log in securely.',
         ]);
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | 4. Revoke Current Device
-    |--------------------------------------------------------------------------
-    */
-
     /**
-     * Revoke only the current device.
+     * Suspicious Login Alerts List
      */
-    public function revokeCurrentDevice(Request $request)
+    public function suspiciousAlerts(Request $request): JsonResponse
     {
         $user = $request->user();
-        $currentToken = $user->currentAccessToken();
-
-        if (!$currentToken) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Current authentication token not found',
-            ], 401);
-        }
-
-        $tokenId = $currentToken->id;
-        $deviceName = $currentToken->name;
-
-        $this->recordActivity(
-            $user,
-            $tokenId,
-            'CURRENT_DEVICE_REVOKED',
-            $request
-        );
-
-        $currentToken->delete();
-
-        return response()->json([
-            'status' => true,
-            'message' => 'Current device revoked successfully',
-            'token_id' => $tokenId,
-            'device_name' => $deviceName,
-        ]);
-    }
-
-    /*
-    |--------------------------------------------------------------------------
-    | 5. Revoke All Other Devices
-    |--------------------------------------------------------------------------
-    */
-
-    /**
-     * Revoke all other device sessions.
-     */
-    public function revokeAllOtherDevices(Request $request)
-    {
-        $user = $request->user();
-        $currentToken = $user->currentAccessToken();
-
-        if (!$currentToken) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Current authentication token not found',
-            ], 401);
-        }
-
-        $currentTokenId = $currentToken->id;
-
-        $otherTokens = $user->tokens()
-            ->where('id', '!=', $currentTokenId)
+        $alerts = $user->authActivities()
+            ->where('is_suspicious', true)
+            ->orWhere('risk_score', '>=', 60)
+            ->latest('created_at')
+            ->limit(20)
             ->get();
 
-        foreach ($otherTokens as $token) {
-            $this->recordActivity(
-                $user,
-                $token->id,
-                'DEVICE_REVOKED',
-                $request
-            );
-        }
-
-        $count = $otherTokens->count();
-
-        $user->tokens()
-            ->where('id', '!=', $currentTokenId)
-            ->delete();
-
         return response()->json([
             'status' => true,
-            'message' => 'All other devices revoked successfully',
-            'current_token_id' => $currentTokenId,
-            'revoked_devices' => $count,
+            'message' => 'Suspicious security alerts retrieved.',
+            'alerts_count' => $alerts->count(),
+            'alerts' => $alerts,
         ]);
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | 6. Device Statistics
-    |--------------------------------------------------------------------------
-    */
-
     /**
-     * Get device/session statistics.
+     * Device statistics.
      */
-    public function deviceStatistics(Request $request)
+    public function deviceStatistics(Request $request): JsonResponse
     {
         $user = $request->user();
-
         $tokens = $user->tokens()->get();
 
-        $currentTokenId = $user->currentAccessToken()?->id;
+        $desktopCount = $tokens->where('device_type', 'Desktop')->count();
+        $mobileCount = $tokens->where('device_type', 'Mobile')->count();
+        $tabletCount = $tokens->where('device_type', 'Tablet')->count();
+        $suspiciousCount = $tokens->where('is_suspicious', true)->count();
 
-        $currentDevice = $tokens->first(
-            fn($token) => $token->id === $currentTokenId
-        );
+        $uniqueCountries = $tokens->pluck('country')->filter()->unique()->values();
 
         return response()->json([
             'status' => true,
-            'message' => 'Device statistics retrieved successfully',
             'statistics' => [
-                'total_devices' => $tokens->count(),
-                'current_device' => $currentDevice?->name,
-                'current_token_id' => $currentTokenId,
-                'oldest_device' => $tokens->sortBy('created_at')->first()?->name,
-                'latest_device' => $tokens->sortByDesc('created_at')->first()?->name,
-                'last_activity' => $tokens
-                    ->sortByDesc('last_used_at')
-                    ->first()?->last_used_at,
+                'total_active_devices' => $tokens->count(),
+                'desktop_devices' => $desktopCount,
+                'mobile_devices' => $mobileCount,
+                'tablet_devices' => $tabletCount,
+                'suspicious_devices' => $suspiciousCount,
+                'active_countries' => $uniqueCountries,
+                'is_frozen' => (bool) $user->is_frozen,
             ],
         ]);
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | 7. Authentication Activity Search / Filter
-    |--------------------------------------------------------------------------
-    */
-
     /**
-     * Search and filter authentication activities.
+     * Security & Activity Summary.
      */
-    public function searchActivities(Request $request)
-    {
-        $validator = Validator::make($request->all(), [
-            'action' => 'nullable|string|max:100',
-            'ip_address' => 'nullable|string|max:100',
-            'from_date' => 'nullable|date',
-            'to_date' => 'nullable|date|after_or_equal:from_date',
-            'per_page' => 'nullable|integer|min:1|max:100',
-        ]);
-
-        if ($validator->fails()) {
-            return response()->json([
-                'status' => false,
-                'errors' => $validator->errors(),
-            ], 422);
-        }
-
-        $query = $request->user()
-            ->authActivities()
-            ->latest();
-
-        if ($request->filled('action')) {
-            $query->where('action', $request->action);
-        }
-
-        if ($request->filled('ip_address')) {
-            $query->where(
-                'ip_address',
-                'like',
-                '%' . $request->ip_address . '%'
-            );
-        }
-
-        if ($request->filled('from_date')) {
-            $query->whereDate(
-                'created_at',
-                '>=',
-                $request->from_date
-            );
-        }
-
-        if ($request->filled('to_date')) {
-            $query->whereDate(
-                'created_at',
-                '<=',
-                $request->to_date
-            );
-        }
-
-        $activities = $query->paginate(
-            $request->integer('per_page', 10)
-        );
-
-        return response()->json([
-            'status' => true,
-            'message' => 'Authentication activities retrieved successfully',
-            'filters' => [
-                'action' => $request->action,
-                'ip_address' => $request->ip_address,
-                'from_date' => $request->from_date,
-                'to_date' => $request->to_date,
-            ],
-            'activities' => $activities,
-        ]);
-    }
-
-    /*
-    |--------------------------------------------------------------------------
-    | 8. Clear Authentication Activities
-    |--------------------------------------------------------------------------
-    */
-
-    /**
-     * Delete authentication activity history.
-     */
-    public function clearActivities(Request $request)
+    public function securitySummary(Request $request): JsonResponse
     {
         $user = $request->user();
-
-        $count = $user->authActivities()->count();
-
-        $user->authActivities()->delete();
-
-        return response()->json([
-            'status' => true,
-            'message' => 'Authentication activity history cleared successfully',
-            'deleted_records' => $count,
-        ]);
-    }
-
-    /*
-    |--------------------------------------------------------------------------
-    | 9. Login Security Summary
-    |--------------------------------------------------------------------------
-    */
-
-    /**
-     * Get authentication security summary.
-     */
-    public function securitySummary(Request $request)
-    {
-        $user = $request->user();
-
         $activities = $user->authActivities();
 
         $totalActivities = $activities->count();
+        $loginCount = (clone $activities)->where('action', 'LOGIN')->count();
+        $logoutCount = (clone $activities)->where('action', 'LOGOUT')->count();
+        $revokedCount = (clone $activities)->whereIn('action', ['DEVICE_REVOKED', 'OTHER_DEVICES_REVOKED', 'ALL_DEVICES_LOGGED_OUT'])->count();
+        $suspiciousCount = (clone $activities)->where('is_suspicious', true)->count();
 
-        $loginCount = (clone $activities)
-            ->where('action', 'LOGIN')
-            ->count();
-
-        $logoutCount = (clone $activities)
-            ->where('action', 'LOGOUT')
-            ->count();
-
-        $deviceRevokedCount = (clone $activities)
-            ->whereIn('action', [
-                'DEVICE_REVOKED',
-                'CURRENT_DEVICE_REVOKED',
-            ])
-            ->count();
-
-        $passwordChangedCount = (clone $activities)
-            ->where('action', 'PASSWORD_CHANGED')
-            ->count();
-
-        $emailChangedCount = (clone $activities)
-            ->where('action', 'EMAIL_CHANGED')
-            ->count();
-
-        $lastLogin = (clone $activities)
-            ->where('action', 'LOGIN')
-            ->latest()
-            ->first();
+        $lastLogin = (clone $activities)->where('action', 'LOGIN')->latest('created_at')->first();
 
         return response()->json([
             'status' => true,
-            'message' => 'Security summary retrieved successfully',
             'summary' => [
                 'total_activities' => $totalActivities,
                 'total_logins' => $loginCount,
                 'total_logouts' => $logoutCount,
-                'devices_revoked' => $deviceRevokedCount,
-                'password_changes' => $passwordChangedCount,
-                'email_changes' => $emailChangedCount,
+                'devices_revoked' => $revokedCount,
+                'suspicious_logins' => $suspiciousCount,
                 'active_devices' => $user->tokens()->count(),
+                'is_frozen' => (bool) $user->is_frozen,
                 'last_login' => $lastLogin ? [
                     'ip_address' => $lastLogin->ip_address,
-                    'user_agent' => $lastLogin->user_agent,
+                    'device_name' => "{$lastLogin->browser} on {$lastLogin->os}",
+                    'location' => "{$lastLogin->city}, {$lastLogin->country}",
+                    'country_code' => $lastLogin->country_code,
                     'logged_at' => $lastLogin->created_at,
+                    'is_suspicious' => $lastLogin->is_suspicious,
                 ] : null,
             ],
         ]);
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | Existing Authentication Activity
-    |--------------------------------------------------------------------------
-    */
-
     /**
-     * Get authentication activity history.
+     * Authentication Activity History with Search & Filters
      */
-    public function activityHistory(Request $request)
+    public function activityHistory(Request $request): JsonResponse
     {
-        $activities = $request->user()
-            ->authActivities()
-            ->latest()
-            ->paginate(
-                $request->integer('per_page', 10)
-            );
+        $activities = $request->user()->authActivities()->latest('created_at')->paginate($request->integer('per_page', 15));
+        return response()->json(['status' => true, 'activities' => $activities]);
+    }
+
+    public function searchActivities(Request $request): JsonResponse
+    {
+        $query = $request->user()->authActivities()->latest('created_at');
+
+        if ($request->filled('action')) {
+            $query->where('action', $request->action);
+        }
+        if ($request->filled('ip_address')) {
+            $query->where('ip_address', 'like', "%{$request->ip_address}%");
+        }
+        if ($request->boolean('suspicious_only')) {
+            $query->where('is_suspicious', true);
+        }
+
+        $activities = $query->paginate($request->integer('per_page', 15));
+        return response()->json(['status' => true, 'activities' => $activities]);
+    }
+
+    public function clearActivities(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        $count = $user->authActivities()->count();
+        $user->authActivities()->delete();
 
         return response()->json([
             'status' => true,
-            'message' => 'Authentication activity retrieved successfully',
-            'activities' => $activities,
+            'message' => 'Authentication activity history cleared.',
+            'deleted_records' => $count,
         ]);
     }
 
     /**
-     * Store authentication activity.
+     * Change Password
+     */
+    public function changePassword(Request $request): JsonResponse
+    {
+        $request->validate([
+            'current_password' => 'required|string',
+            'new_password' => 'required|string|min:6|confirmed',
+        ]);
+
+        $user = $request->user();
+
+        if (!Hash::check($request->current_password, $user->password)) {
+            return response()->json(['status' => false, 'message' => 'Current password does not match.'], 400);
+        }
+
+        $user->update(['password' => Hash::make($request->new_password)]);
+
+        $fingerprint = $this->fingerprintService->inspect($request, $user);
+        $this->recordActivity($user, $user->currentAccessToken()?->id, 'PASSWORD_CHANGED', $request, $fingerprint);
+
+        return response()->json(['status' => true, 'message' => 'Password updated successfully!']);
+    }
+
+    /**
+     * Change Email
+     */
+    public function changeEmail(Request $request): JsonResponse
+    {
+        $request->validate([
+            'email' => 'required|email|unique:users,email,' . $request->user()->id,
+            'password' => 'required|string',
+        ]);
+
+        $user = $request->user();
+
+        if (!Hash::check($request->password, $user->password)) {
+            return response()->json(['status' => false, 'message' => 'Password verification failed.'], 400);
+        }
+
+        $user->update(['email' => $request->email]);
+
+        $fingerprint = $this->fingerprintService->inspect($request, $user);
+        $this->recordActivity($user, $user->currentAccessToken()?->id, 'EMAIL_CHANGED', $request, $fingerprint);
+
+        return response()->json(['status' => true, 'message' => 'Email updated successfully!']);
+    }
+
+    /**
+     * Internal helper to record activity log.
      */
     private function recordActivity(
         User $user,
         ?int $tokenId,
         string $action,
-        Request $request
+        Request $request,
+        array $fingerprint = [],
+        ?string $reason = null
     ): void {
         AuthActivity::create([
             'user_id' => $user->id,
             'token_id' => $tokenId,
             'action' => $action,
-            'ip_address' => $request->ip(),
-            'user_agent' => $request->userAgent(),
+            'ip_address' => $fingerprint['ip_address'] ?? $request->ip(),
+            'user_agent' => $fingerprint['user_agent'] ?? $request->userAgent(),
+            'device_type' => $fingerprint['device_type'] ?? 'Desktop',
+            'browser' => $fingerprint['browser'] ?? 'Web Browser',
+            'os' => $fingerprint['os'] ?? 'Unknown OS',
+            'city' => $fingerprint['city'] ?? 'Local',
+            'country' => $fingerprint['country'] ?? 'Network',
+            'country_code' => $fingerprint['country_code'] ?? 'IN',
+            'is_suspicious' => $fingerprint['is_suspicious'] ?? false,
+            'risk_score' => $fingerprint['risk_score'] ?? 0,
+            'risk_reason' => $reason ?: ($fingerprint['risk_reason'] ?? null),
         ]);
     }
 }

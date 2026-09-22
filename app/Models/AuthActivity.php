@@ -14,7 +14,24 @@ class AuthActivity extends Model
         'action',
         'ip_address',
         'user_agent',
+        'device_type',
+        'browser',
+        'os',
+        'city',
+        'country',
+        'country_code',
+        'is_suspicious',
+        'risk_score',
+        'risk_reason',
     ];
+
+    protected function casts(): array
+    {
+        return [
+            'is_suspicious' => 'boolean',
+            'risk_score' => 'integer',
+        ];
+    }
 
     /**
      * Activity belongs to a user.
